@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gspread
 import requests
@@ -66,7 +66,6 @@ class Config:
     order_fraction: float
     dry_run: bool
     log_level: str
-    clear_trigger_after_fill: bool
     request_timeout_seconds: int
 
     @property
@@ -91,7 +90,6 @@ def load_config() -> Config:
         order_fraction=env_float("ORDER_FRACTION", 0.02),
         dry_run=env_bool("DRY_RUN", False),
         log_level=env_str("LOG_LEVEL", "INFO"),
-        clear_trigger_after_fill=env_bool("CLEAR_TRIGGER_AFTER_FILL", False),
         request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 20)),
     )
 
@@ -236,19 +234,12 @@ class OandaClient:
 # =========================
 
 
-STATUS_COL = "F"
-ACTION_AT_COL = "G"
-ORDER_ID_COL = "H"
-ERROR_COL = "I"
-
-
 @dataclass
 class SignalRow:
     row_number: int
     pair_raw: str
     side_raw: str
     trigger_raw: Any
-    status_raw: str
 
     @property
     def instrument(self) -> str:
@@ -276,11 +267,6 @@ class OrderPlan:
     sizing_method: str
     reference_price: float
     client_id: str
-
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 
@@ -317,23 +303,8 @@ def round_down(value: float, decimals: int) -> float:
     return math.floor(value * factor) / factor
 
 
-
-def state_for_side(prefix: str, side: str) -> str:
-    return f"{prefix}_{side}"
-
-
-
-def should_skip_due_to_state(state: str, side: str) -> bool:
-    normalized = (state or "").strip().upper()
-    return normalized in {
-        state_for_side("DONE", side),
-        state_for_side("IN_PROGRESS", side),
-        state_for_side("ERROR", side),
-    }
-
-
 # =========================
-# Sheet access
+# Sheet access (read-only)
 # =========================
 
 
@@ -345,14 +316,13 @@ class SheetClient:
         self.ws = self.sheet.worksheet(config.worksheet_name)
 
     def read_signal_rows(self) -> List[SignalRow]:
-        values = self.ws.get("B2:I", value_render_option="UNFORMATTED_VALUE")
+        values = self.ws.get("B2:E", value_render_option="UNFORMATTED_VALUE")
         rows: List[SignalRow] = []
         for idx, row in enumerate(values, start=2):
-            padded = list(row) + [""] * (8 - len(row))
+            padded = list(row) + [""] * (4 - len(row))
             pair = str(padded[0]).strip() if padded[0] is not None else ""
             side = str(padded[2]).strip() if padded[2] is not None else ""
             trigger = padded[3]
-            status = str(padded[4]).strip() if padded[4] is not None else ""
             if not pair:
                 continue
             rows.append(
@@ -361,39 +331,9 @@ class SheetClient:
                     pair_raw=pair,
                     side_raw=side,
                     trigger_raw=trigger,
-                    status_raw=status,
                 )
             )
         return rows
-
-    def update_row_status(
-        self,
-        row_number: int,
-        status: str,
-        action_at: str,
-        order_id: str = "",
-        error_message: str = "",
-        clear_trigger: bool = False,
-    ) -> None:
-        updates = [
-            {"range": f"{STATUS_COL}{row_number}", "values": [[status]]},
-            {"range": f"{ACTION_AT_COL}{row_number}", "values": [[action_at]]},
-            {"range": f"{ORDER_ID_COL}{row_number}", "values": [[order_id]]},
-            {"range": f"{ERROR_COL}{row_number}", "values": [[error_message]]},
-        ]
-        if clear_trigger:
-            updates.append({"range": f"E{row_number}", "values": [[False]]})
-        self.ws.batch_update(updates)
-
-    def clear_row_status(self, row_number: int) -> None:
-        self.ws.batch_update(
-            [
-                {
-                    "range": f"{STATUS_COL}{row_number}:{ERROR_COL}{row_number}",
-                    "values": [["", "", "", ""]],
-                },
-            ]
-        )
 
 
 # =========================
@@ -407,6 +347,7 @@ class SignalsBot:
         self.sheet = SheetClient(config)
         self.oanda = OandaClient(config)
         self.running = True
+        self.armed_signals: Set[Tuple[int, str, str]] = set()
 
     def stop(self, *_args: Any) -> None:
         logger.info("Shutdown signal received. Stopping after current loop.")
@@ -414,7 +355,7 @@ class SignalsBot:
 
     def run_forever(self) -> None:
         logger.info(
-            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s",
+            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only",
             self.config.worksheet_name,
             self.config.poll_seconds,
             self.config.dry_run,
@@ -436,38 +377,33 @@ class SignalsBot:
         for row in rows:
             self.process_row(row)
 
-    def process_row(self, row: SignalRow) -> None:
+    def signal_key(self, row: SignalRow) -> Optional[Tuple[int, str, str]]:
         try:
-            side = row.side if row.side_raw else ""
+            return (row.row_number, row.instrument, row.side)
         except Exception:
-            side = (row.side_raw or "").strip().upper()
+            return None
+
+    def process_row(self, row: SignalRow) -> None:
+        signal_key = self.signal_key(row)
 
         if not row.triggered:
-            if row.status_raw:
-                logger.info("Row %s trigger reset. Clearing status columns.", row.row_number)
-                self.sheet.clear_row_status(row.row_number)
+            if signal_key and signal_key in self.armed_signals:
+                logger.info(
+                    "Row %s trigger reset. Re-arming row for the next signal.",
+                    row.row_number,
+                )
+                self.armed_signals.discard(signal_key)
             return
 
-        if should_skip_due_to_state(row.status_raw, side):
+        if signal_key and signal_key in self.armed_signals:
             logger.debug(
-                "Row %s skipped because status '%s' is already armed for %s",
+                "Row %s already executed for current TRUE trigger. Waiting for reset.",
                 row.row_number,
-                row.status_raw,
-                side,
             )
             return
-
-        timestamp = now_utc_iso()
 
         try:
             plan = self.build_order_plan(row)
-            self.sheet.update_row_status(
-                row_number=row.row_number,
-                status=state_for_side("IN_PROGRESS", plan.side),
-                action_at=timestamp,
-                order_id="",
-                error_message="",
-            )
 
             if self.config.dry_run:
                 logger.info(
@@ -481,14 +417,7 @@ class SignalsBot:
                     plan.margin_available,
                     plan.target_margin_budget,
                 )
-                self.sheet.update_row_status(
-                    row_number=row.row_number,
-                    status=state_for_side("DONE", plan.side),
-                    action_at=timestamp,
-                    order_id=f"DRYRUN-{plan.client_id}",
-                    error_message="",
-                    clear_trigger=self.config.clear_trigger_after_fill,
-                )
+                self.armed_signals.add((row.row_number, plan.instrument, plan.side))
                 return
 
             response = self.oanda.place_market_order(
@@ -513,27 +442,9 @@ class SignalsBot:
                 plan.units,
                 order_id,
             )
-            self.sheet.update_row_status(
-                row_number=row.row_number,
-                status=state_for_side("DONE", plan.side),
-                action_at=now_utc_iso(),
-                order_id=order_id,
-                error_message="",
-                clear_trigger=self.config.clear_trigger_after_fill,
-            )
+            self.armed_signals.add((row.row_number, plan.instrument, plan.side))
         except Exception as exc:
             logger.exception("Row %s failed: %s", row.row_number, exc)
-            error_text = str(exc)
-            if len(error_text) > 400:
-                error_text = error_text[:400]
-            effective_side = side or "UNKNOWN"
-            self.sheet.update_row_status(
-                row_number=row.row_number,
-                status=state_for_side("ERROR", effective_side),
-                action_at=timestamp,
-                order_id="",
-                error_message=error_text,
-            )
 
     def build_order_plan(self, row: SignalRow) -> OrderPlan:
         instrument = row.instrument
@@ -633,6 +544,7 @@ class SignalsBot:
 # =========================
 # Entrypoint
 # =========================
+
 
 
 def main() -> None:
