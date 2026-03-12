@@ -1,0 +1,7 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+startCommand = "python -m src.main"
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10

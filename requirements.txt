@@ -1,7 +1,145 @@
-[build]
-builder = "DOCKERFILE"
+# OANDA Signals Sheet Bot
 
-[deploy]
-startCommand = "python -m src.main"
-restartPolicyType = "ALWAYS"
-restartPolicyMaxRetries = 10
+A Python bot for Railway that:
+
+- watches the `Signals` worksheet in Google Sheets
+- reads forex pairs from column **B**
+- checks column **E** for `TRUE`
+- reads column **D** for `LONG` or `SHORT`
+- submits an OANDA **market order** for **2% of available buying power**
+- runs continuously in a loop
+
+## Sheet layout
+
+This bot expects the `Signals` tab to use these columns:
+
+- **B** = forex pair (`EUR_USD`, `EUR/USD`, or `EURUSD` all work)
+- **D** = side (`LONG` or `SHORT`)
+- **E** = trigger (`TRUE` / `FALSE`)
+
+The bot also uses these status columns so it does not keep firing the same row every polling cycle:
+
+- **F** = bot status (`IN_PROGRESS_LONG`, `DONE_SHORT`, `ERROR_LONG`, etc.)
+- **G** = last action timestamp (UTC)
+- **H** = OANDA order id
+- **I** = last error message
+
+## Important behavior
+
+If column **E** stays `TRUE`, the bot will only place the order once for that same side because it marks the row in column **F**.
+
+To re-arm the row:
+
+1. set **E** to `FALSE`
+2. let the bot clear its status
+3. set **E** back to `TRUE`
+
+If you want the bot to automatically set **E** back to `FALSE` after a fill, set:
+
+```env
+CLEAR_TRIGGER_AFTER_FILL=true
+```
+
+## Position sizing
+
+The bot interprets “2% of available buying power” as **2% of OANDA available margin**.
+
+Sizing logic:
+
+1. read `marginAvailable` from the OANDA account
+2. read pricing for the requested instrument
+3. if OANDA returns `unitsAvailable`, use 2% of that side's available units
+4. otherwise fall back to computing units from:
+   - available margin budget
+   - instrument margin rate
+   - current bid/ask
+   - home currency conversion factors
+
+## Files
+
+- `src/main.py` - main bot loop
+- `requirements.txt` - Python dependencies
+- `.env.example` - environment variables template
+- `railway.toml` - Railway config
+- `Dockerfile` - container build
+
+## Local run
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# fill in your real values
+export $(grep -v '^#' .env | xargs)
+python -m src.main
+```
+
+## Railway deployment
+
+If Railway throws a config-as-code parse error for `railway.toml`, use the included `railway.json` instead by either:
+
+1. deleting `railway.toml` and keeping `railway.json`, or
+2. setting the service's custom config path to `/railway.json`.
+
+
+### 1. Create the GitHub repo
+
+Push this folder to a new GitHub repo.
+
+### 2. Deploy on Railway
+
+In Railway:
+
+1. create a new project
+2. choose **Deploy from GitHub repo**
+3. select this repo
+4. Railway will build from the included `Dockerfile`
+
+### 3. Add environment variables
+
+Set these in Railway:
+
+- `OANDA_ACCOUNT_ID`
+- `OANDA_API_TOKEN`
+- `OANDA_ENVIRONMENT`
+- `SHEET_ID`
+- `SIGNALS_WORKSHEET`
+- `GOOGLE_SHEETS_CREDENTIALS_JSON`
+- `POLL_SECONDS`
+- `ORDER_FRACTION`
+- `DRY_RUN`
+- `LOG_LEVEL`
+- `CLEAR_TRIGGER_AFTER_FILL`
+- `REQUEST_TIMEOUT_SECONDS`
+
+Recommended first deployment:
+
+```env
+DRY_RUN=true
+ORDER_FRACTION=0.02
+POLL_SECONDS=10
+LOG_LEVEL=INFO
+```
+
+After you confirm the logs look right, switch:
+
+```env
+DRY_RUN=false
+```
+
+## Google Sheets setup
+
+Create a Google Cloud service account and enable Sheets API. Share the sheet with the service account email address so the bot can read and write the worksheet.
+
+## OANDA setup
+
+Use your OANDA v20 account id and personal access token. Start with a **practice** account before live trading.
+
+## Notes
+
+- This bot assumes the sheet only contains **forex pairs** in column B.
+- Orders are **market** orders only.
+- `LONG` submits positive units; `SHORT` submits negative units.
+- If OANDA rejects an order, the row is marked as `ERROR_*` and the error text is written into column **I**.
+- Toggle column **E** back to `FALSE` to clear the status and retry.
