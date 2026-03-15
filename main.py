@@ -80,6 +80,7 @@ class Config:
     dry_run: bool
     log_level: str
     request_timeout_seconds: int
+    enable_entry_time_blocks: bool
 
     @property
     def oanda_base_url(self) -> str:
@@ -103,6 +104,7 @@ def load_config() -> Config:
         dry_run=env_bool("DRY_RUN", False),
         log_level=env_str("LOG_LEVEL", "INFO"),
         request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 20)),
+        enable_entry_time_blocks=env_bool("ENABLE_ENTRY_TIME_BLOCKS", True),
     )
 
 
@@ -362,10 +364,11 @@ class SignalsBot:
 
     def run_forever(self) -> None:
         logger.info(
-            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only",
+            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only | entry_time_blocks=%s",
             self.config.worksheet_name,
             self.config.poll_seconds,
             self.config.dry_run,
+            self.config.enable_entry_time_blocks,
         )
         while self.running:
             started = time.time()
@@ -391,6 +394,9 @@ class SignalsBot:
             return None
 
     def entry_block_reason(self, now: Optional[datetime] = None) -> Optional[str]:
+        if not self.config.enable_entry_time_blocks:
+            return None
+
         now = now or datetime.now(NY_TZ)
         weekday = now.weekday()  # Mon=0 ... Sun=6
         minute_of_day = now.hour * 60 + now.minute
