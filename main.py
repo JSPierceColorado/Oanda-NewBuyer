@@ -9,9 +9,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import gspread
 import requests
+
+
+# =========================
+# Time windows
+# =========================
+
+NY_TZ = ZoneInfo("America/New_York")
+
+# Daily rollover / maintenance buffer
+ROLLOVER_BLOCK_START_MINUTE = 16 * 60 + 55   # 16:55 NY
+ROLLOVER_BLOCK_END_MINUTE = 17 * 60 + 10     # 17:10 NY
+
+# Weekly close/open buffer
+WEEKLY_CLOSE_BUFFER_START_MINUTE = 4 * 60 + 59   # Friday 04:59 NY
+WEEKLY_OPEN_BUFFER_END_MINUTE = 5 * 60 + 5       # Monday 05:05 NY
 
 
 # =========================
@@ -26,7 +42,6 @@ def env_str(name: str, default: Optional[str] = None, required: bool = False) ->
     return "" if value is None else str(value)
 
 
-
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -34,13 +49,11 @@ def env_float(name: str, default: float) -> float:
     return float(value)
 
 
-
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return int(default)
     return int(value)
-
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -78,7 +91,6 @@ class Config:
         raise ValueError("OANDA_ENVIRONMENT must be one of: practice, live")
 
 
-
 def load_config() -> Config:
     return Config(
         oanda_account_id=env_str("OANDA_ACCOUNT_ID", required=True),
@@ -99,7 +111,6 @@ def load_config() -> Config:
 # =========================
 
 
-
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -114,7 +125,6 @@ logger = logging.getLogger("oanda-signals-bot")
 # =========================
 # Google Sheets client
 # =========================
-
 
 
 def build_gspread_client() -> gspread.Client:
@@ -269,14 +279,12 @@ class OrderPlan:
     client_id: str
 
 
-
 def parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if value is None:
         return False
     return str(value).strip().upper() == "TRUE"
-
 
 
 def normalize_instrument(value: str) -> str:
@@ -295,7 +303,6 @@ def normalize_instrument(value: str) -> str:
         return f"{cleaned[:3]}_{cleaned[3:]}"
 
     raise ValueError(f"Unsupported pair format '{value}'")
-
 
 
 def round_down(value: float, decimals: int) -> float:
@@ -383,6 +390,28 @@ class SignalsBot:
         except Exception:
             return None
 
+    def entry_block_reason(self, now: Optional[datetime] = None) -> Optional[str]:
+        now = now or datetime.now(NY_TZ)
+        weekday = now.weekday()  # Mon=0 ... Sun=6
+        minute_of_day = now.hour * 60 + now.minute
+
+        # Daily rollover / maintenance window
+        if ROLLOVER_BLOCK_START_MINUTE <= minute_of_day < ROLLOVER_BLOCK_END_MINUTE:
+            return "daily rollover / maintenance window"
+
+        # Weekly close/open protection window
+        # Friday 04:59 NY -> Monday 05:05 NY
+        if weekday == 4 and minute_of_day >= WEEKLY_CLOSE_BUFFER_START_MINUTE:
+            return "within 12h of weekly close"
+        if weekday == 5:
+            return "weekend market closure"
+        if weekday == 6:
+            return "within 12h of weekly reopen"
+        if weekday == 0 and minute_of_day < WEEKLY_OPEN_BUFFER_END_MINUTE:
+            return "within 12h of weekly reopen"
+
+        return None
+
     def process_row(self, row: SignalRow) -> None:
         signal_key = self.signal_key(row)
 
@@ -399,6 +428,17 @@ class SignalsBot:
             logger.debug(
                 "Row %s already executed for current TRUE trigger. Waiting for reset.",
                 row.row_number,
+            )
+            return
+
+        block_reason = self.entry_block_reason()
+        if block_reason:
+            logger.info(
+                "ENTRY BLOCKED | row=%s | pair=%s | side=%s | reason=%s",
+                row.row_number,
+                row.pair_raw,
+                row.side_raw,
+                block_reason,
             )
             return
 
@@ -544,7 +584,6 @@ class SignalsBot:
 # =========================
 # Entrypoint
 # =========================
-
 
 
 def main() -> None:
