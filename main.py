@@ -42,6 +42,7 @@ def env_str(name: str, default: Optional[str] = None, required: bool = False) ->
     return "" if value is None else str(value)
 
 
+
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -49,11 +50,13 @@ def env_float(name: str, default: float) -> float:
     return float(value)
 
 
+
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return int(default)
     return int(value)
+
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -90,6 +93,7 @@ class Config:
         if env_name in {"live", "fxtrade", "prod", "production"}:
             return "https://api-fxtrade.oanda.com/v3"
         raise ValueError("OANDA_ENVIRONMENT must be one of: practice, live")
+
 
 
 def load_config() -> Config:
@@ -219,7 +223,15 @@ class OandaClient:
         client_id: str,
         side: str,
         row_number: int,
+        strategy_id: str,
+        arm_pct: float,
+        trail_drop_pct: float,
+        stop_loss_pct: float,
     ) -> Dict[str, Any]:
+        comment = (
+            f"{side} row {row_number} strat={strategy_id} "
+            f"arm={arm_pct:.4f} trail={trail_drop_pct:.4f} stop={stop_loss_pct:.4f}"
+        )[:128]
         body = {
             "order": {
                 "type": "MARKET",
@@ -229,8 +241,15 @@ class OandaClient:
                 "positionFill": "DEFAULT",
                 "clientExtensions": {
                     "id": client_id,
-                    "tag": "signals-sheet-bot",
-                    "comment": f"{side} row {row_number}",
+                    "tag": f"buyer-{strategy_id}"[:128],
+                    "comment": comment,
+                },
+                "tradeClientExtensions": {
+                    "id": f"trade-{client_id}"[:128],
+                    "tag": f"strategy:{strategy_id}"[:128],
+                    "comment": (
+                        f"arm={arm_pct:.4f}|trail={trail_drop_pct:.4f}|stop={stop_loss_pct:.4f}"
+                    )[:128],
                 },
             }
         }
@@ -252,6 +271,13 @@ class SignalRow:
     pair_raw: str
     side_raw: str
     trigger_raw: Any
+    strategy_id_raw: str
+    arm_pct_raw: Any
+    trail_drop_pct_raw: Any
+    stop_loss_pct_raw: Any
+    score_raw: Any = None
+    threshold_raw: Any = None
+    trained_at_raw: Any = None
 
     @property
     def instrument(self) -> str:
@@ -268,6 +294,37 @@ class SignalRow:
     def triggered(self) -> bool:
         return parse_bool(self.trigger_raw)
 
+    @property
+    def strategy_id(self) -> str:
+        value = (self.strategy_id_raw or "").strip()
+        if not value:
+            raise ValueError("Missing strategy_id in Signals row")
+        return value
+
+    @property
+    def arm_pct(self) -> float:
+        return parse_required_float(self.arm_pct_raw, "arm_pct")
+
+    @property
+    def trail_drop_pct(self) -> float:
+        return parse_required_float(self.trail_drop_pct_raw, "trail_drop_pct")
+
+    @property
+    def stop_loss_pct(self) -> float:
+        return parse_required_float(self.stop_loss_pct_raw, "stop_loss_pct")
+
+    @property
+    def score(self) -> Optional[float]:
+        return parse_optional_float(self.score_raw)
+
+    @property
+    def threshold(self) -> Optional[float]:
+        return parse_optional_float(self.threshold_raw)
+
+    @property
+    def trained_at(self) -> str:
+        return "" if self.trained_at_raw is None else str(self.trained_at_raw).strip()
+
 
 @dataclass
 class OrderPlan:
@@ -279,6 +336,14 @@ class OrderPlan:
     sizing_method: str
     reference_price: float
     client_id: str
+    strategy_id: str
+    arm_pct: float
+    trail_drop_pct: float
+    stop_loss_pct: float
+    score: Optional[float]
+    threshold: Optional[float]
+    trained_at: str
+
 
 
 def parse_bool(value: Any) -> bool:
@@ -287,6 +352,27 @@ def parse_bool(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().upper() == "TRUE"
+
+
+
+def parse_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text == "":
+        return None
+    return float(text)
+
+
+
+def parse_required_float(value: Any, field_name: str) -> float:
+    parsed = parse_optional_float(value)
+    if parsed is None:
+        raise ValueError(f"Missing {field_name} in Signals row")
+    return parsed
+
 
 
 def normalize_instrument(value: str) -> str:
@@ -307,9 +393,15 @@ def normalize_instrument(value: str) -> str:
     raise ValueError(f"Unsupported pair format '{value}'")
 
 
+
 def round_down(value: float, decimals: int) -> float:
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
+
+
+
+def normalize_header(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 # =========================
@@ -318,6 +410,16 @@ def round_down(value: float, decimals: int) -> float:
 
 
 class SheetClient:
+    REQUIRED_HEADERS = {
+        "symbol",
+        "side",
+        "entry_signal",
+        "strategy_id",
+        "arm_pct",
+        "trail_drop_pct",
+        "stop_loss_pct",
+    }
+
     def __init__(self, config: Config):
         self.config = config
         self.gc = build_gspread_client()
@@ -325,21 +427,45 @@ class SheetClient:
         self.ws = self.sheet.worksheet(config.worksheet_name)
 
     def read_signal_rows(self) -> List[SignalRow]:
-        values = self.ws.get("B2:E", value_render_option="UNFORMATTED_VALUE")
+        all_values = self.ws.get_all_values()
+        if not all_values:
+            return []
+
+        headers = [normalize_header(h) for h in all_values[0]]
+        header_map = {name: idx for idx, name in enumerate(headers) if name}
+        missing = sorted(self.REQUIRED_HEADERS - set(header_map))
+        if missing:
+            raise ValueError(
+                f"Signals sheet is missing required headers: {', '.join(missing)}"
+            )
+
         rows: List[SignalRow] = []
-        for idx, row in enumerate(values, start=2):
-            padded = list(row) + [""] * (4 - len(row))
-            pair = str(padded[0]).strip() if padded[0] is not None else ""
-            side = str(padded[2]).strip() if padded[2] is not None else ""
-            trigger = padded[3]
+        for idx, row in enumerate(all_values[1:], start=2):
+            padded = list(row) + [""] * max(0, len(headers) - len(row))
+
+            def get(name: str) -> Any:
+                pos = header_map.get(name)
+                if pos is None or pos >= len(padded):
+                    return ""
+                return padded[pos]
+
+            pair = str(get("symbol")).strip()
             if not pair:
                 continue
+
             rows.append(
                 SignalRow(
                     row_number=idx,
                     pair_raw=pair,
-                    side_raw=side,
-                    trigger_raw=trigger,
+                    side_raw=str(get("side")).strip(),
+                    trigger_raw=get("entry_signal"),
+                    strategy_id_raw=str(get("strategy_id")).strip(),
+                    arm_pct_raw=get("arm_pct"),
+                    trail_drop_pct_raw=get("trail_drop_pct"),
+                    stop_loss_pct_raw=get("stop_loss_pct"),
+                    score_raw=get("score"),
+                    threshold_raw=get("threshold"),
+                    trained_at_raw=get("trained_at"),
                 )
             )
         return rows
@@ -356,7 +482,7 @@ class SignalsBot:
         self.sheet = SheetClient(config)
         self.oanda = OandaClient(config)
         self.running = True
-        self.armed_signals: Set[Tuple[int, str, str]] = set()
+        self.armed_signals: Set[Tuple[int, str, str, str]] = set()
 
     def stop(self, *_args: Any) -> None:
         logger.info("Shutdown signal received. Stopping after current loop.")
@@ -387,9 +513,9 @@ class SignalsBot:
         for row in rows:
             self.process_row(row)
 
-    def signal_key(self, row: SignalRow) -> Optional[Tuple[int, str, str]]:
+    def signal_key(self, row: SignalRow) -> Optional[Tuple[int, str, str, str]]:
         try:
-            return (row.row_number, row.instrument, row.side)
+            return (row.row_number, row.instrument, row.side, row.strategy_id)
         except Exception:
             return None
 
@@ -401,12 +527,9 @@ class SignalsBot:
         weekday = now.weekday()  # Mon=0 ... Sun=6
         minute_of_day = now.hour * 60 + now.minute
 
-        # Daily rollover / maintenance window
         if ROLLOVER_BLOCK_START_MINUTE <= minute_of_day < ROLLOVER_BLOCK_END_MINUTE:
             return "daily rollover / maintenance window"
 
-        # Weekly close/open protection window
-        # Friday 04:59 NY -> Monday 05:05 NY
         if weekday == 4 and minute_of_day >= WEEKLY_CLOSE_BUFFER_START_MINUTE:
             return "within 12h of weekly close"
         if weekday == 5:
@@ -440,10 +563,14 @@ class SignalsBot:
         block_reason = self.entry_block_reason()
         if block_reason:
             logger.info(
-                "ENTRY BLOCKED | row=%s | pair=%s | side=%s | reason=%s",
+                "ENTRY BLOCKED | row=%s | pair=%s | side=%s | strategy_id=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | reason=%s",
                 row.row_number,
                 row.pair_raw,
                 row.side_raw,
+                row.strategy_id,
+                row.arm_pct,
+                row.trail_drop_pct,
+                row.stop_loss_pct,
                 block_reason,
             )
             return
@@ -453,17 +580,24 @@ class SignalsBot:
 
             if self.config.dry_run:
                 logger.info(
-                    "DRY RUN | row=%s | instrument=%s | side=%s | units=%s | sizing=%s | ref_price=%s | margin_available=%.2f | target_budget=%.2f",
+                    "DRY RUN ENTRY | row=%s | instrument=%s | side=%s | units=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | sizing=%s | ref_price=%s | margin_available=%.2f | target_budget=%.2f | trained_at=%s",
                     row.row_number,
                     plan.instrument,
                     plan.side,
                     plan.units,
+                    plan.strategy_id,
+                    f"{plan.score:.2f}" if plan.score is not None else "",
+                    f"{plan.threshold:.2f}" if plan.threshold is not None else "",
+                    plan.arm_pct,
+                    plan.trail_drop_pct,
+                    plan.stop_loss_pct,
                     plan.sizing_method,
                     plan.reference_price,
                     plan.margin_available,
                     plan.target_margin_budget,
+                    plan.trained_at,
                 )
-                self.armed_signals.add((row.row_number, plan.instrument, plan.side))
+                self.armed_signals.add((row.row_number, plan.instrument, plan.side, plan.strategy_id))
                 return
 
             response = self.oanda.place_market_order(
@@ -472,6 +606,10 @@ class SignalsBot:
                 client_id=plan.client_id,
                 side=plan.side,
                 row_number=row.row_number,
+                strategy_id=plan.strategy_id,
+                arm_pct=plan.arm_pct,
+                trail_drop_pct=plan.trail_drop_pct,
+                stop_loss_pct=plan.stop_loss_pct,
             )
 
             order_id = (
@@ -479,16 +617,30 @@ class SignalsBot:
                 or response.get("orderCreateTransaction", {}).get("id")
                 or ""
             )
+            trade_id = (
+                response.get("orderFillTransaction", {}).get("tradeOpened", {}).get("tradeID")
+                or response.get("orderFillTransaction", {}).get("tradeReduced", {}).get("tradeID")
+                or response.get("orderFillTransaction", {}).get("tradesOpened", [{}])[0].get("tradeID", "")
+                or ""
+            )
 
             logger.info(
-                "ORDER PLACED | row=%s | instrument=%s | side=%s | units=%s | order_id=%s",
+                "ORDER PLACED | row=%s | instrument=%s | side=%s | units=%s | order_id=%s | trade_id=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | trained_at=%s",
                 row.row_number,
                 plan.instrument,
                 plan.side,
                 plan.units,
                 order_id,
+                trade_id,
+                plan.strategy_id,
+                f"{plan.score:.2f}" if plan.score is not None else "",
+                f"{plan.threshold:.2f}" if plan.threshold is not None else "",
+                plan.arm_pct,
+                plan.trail_drop_pct,
+                plan.stop_loss_pct,
+                plan.trained_at,
             )
-            self.armed_signals.add((row.row_number, plan.instrument, plan.side))
+            self.armed_signals.add((row.row_number, plan.instrument, plan.side, plan.strategy_id))
         except Exception as exc:
             logger.exception("Row %s failed: %s", row.row_number, exc)
 
@@ -512,6 +664,7 @@ class SignalsBot:
             price["asks"][0]["price"] if is_long else price["bids"][0]["price"]
         )
         target_margin_budget = margin_available * self.config.order_fraction
+        client_id = self._client_id(row.row_number, instrument, side, row.strategy_id)
 
         units_available = price.get("unitsAvailable") or {}
         default_bucket = units_available.get("default") or {}
@@ -530,7 +683,14 @@ class SignalsBot:
                 target_margin_budget=target_margin_budget,
                 sizing_method="unitsAvailable.default",
                 reference_price=reference_price,
-                client_id=self._client_id(row.row_number, instrument, side),
+                client_id=client_id,
+                strategy_id=row.strategy_id,
+                arm_pct=row.arm_pct,
+                trail_drop_pct=row.trail_drop_pct,
+                stop_loss_pct=row.stop_loss_pct,
+                score=row.score,
+                threshold=row.threshold,
+                trained_at=row.trained_at,
             )
 
         instrument_meta = self.oanda.get_instrument_details(instrument)
@@ -577,14 +737,22 @@ class SignalsBot:
             target_margin_budget=target_margin_budget,
             sizing_method="marginAvailable/homeConversions/marginRate",
             reference_price=reference_price,
-            client_id=self._client_id(row.row_number, instrument, side),
+            client_id=client_id,
+            strategy_id=row.strategy_id,
+            arm_pct=row.arm_pct,
+            trail_drop_pct=row.trail_drop_pct,
+            stop_loss_pct=row.stop_loss_pct,
+            score=row.score,
+            threshold=row.threshold,
+            trained_at=row.trained_at,
         )
 
     @staticmethod
-    def _client_id(row_number: int, instrument: str, side: str) -> str:
+    def _client_id(row_number: int, instrument: str, side: str, strategy_id: str) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         compact_instrument = instrument.replace("_", "")
-        return f"sig-{row_number}-{compact_instrument}-{side.lower()}-{stamp}"[:128]
+        compact_strategy = "".join(ch for ch in strategy_id if ch.isalnum())[:16] or "nostrat"
+        return f"sig-{row_number}-{compact_instrument}-{side.lower()}-{compact_strategy}-{stamp}"[:128]
 
 
 # =========================
