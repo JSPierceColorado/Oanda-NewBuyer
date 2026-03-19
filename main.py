@@ -34,13 +34,11 @@ WEEKLY_OPEN_BUFFER_END_MINUTE = 5 * 60 + 5       # Monday 05:05 NY
 # Environment helpers
 # =========================
 
-
 def env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
     value = os.getenv(name, default)
     if required and (value is None or str(value).strip() == ""):
         raise ValueError(f"Missing required env var: {name}")
     return "" if value is None else str(value)
-
 
 
 def env_float(name: str, default: float) -> float:
@@ -50,13 +48,11 @@ def env_float(name: str, default: float) -> float:
     return float(value)
 
 
-
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return int(default)
     return int(value)
-
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -70,7 +66,6 @@ def env_bool(name: str, default: bool = False) -> bool:
 # Config
 # =========================
 
-
 @dataclass(frozen=True)
 class Config:
     oanda_account_id: str
@@ -80,6 +75,7 @@ class Config:
     worksheet_name: str
     poll_seconds: int
     order_fraction: float
+    max_margin_usage_pct: float
     dry_run: bool
     log_level: str
     request_timeout_seconds: int
@@ -95,8 +91,11 @@ class Config:
         raise ValueError("OANDA_ENVIRONMENT must be one of: practice, live")
 
 
-
 def load_config() -> Config:
+    max_margin_usage_pct = env_float("MAX_MARGIN_USAGE_PCT", 0.90)
+    if not (0.0 < max_margin_usage_pct < 1.0):
+        raise ValueError("MAX_MARGIN_USAGE_PCT must be > 0 and < 1 (example: 0.90)")
+
     return Config(
         oanda_account_id=env_str("OANDA_ACCOUNT_ID", required=True),
         oanda_api_token=env_str("OANDA_API_TOKEN", required=True),
@@ -105,6 +104,7 @@ def load_config() -> Config:
         worksheet_name=env_str("SIGNALS_WORKSHEET", "Signals"),
         poll_seconds=max(3, env_int("POLL_SECONDS", 10)),
         order_fraction=env_float("ORDER_FRACTION", 0.02),
+        max_margin_usage_pct=max_margin_usage_pct,
         dry_run=env_bool("DRY_RUN", False),
         log_level=env_str("LOG_LEVEL", "INFO"),
         request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 20)),
@@ -115,7 +115,6 @@ def load_config() -> Config:
 # =========================
 # Logging
 # =========================
-
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -131,7 +130,6 @@ logger = logging.getLogger("oanda-signals-bot")
 # =========================
 # Google Sheets client
 # =========================
-
 
 def build_gspread_client() -> gspread.Client:
     credentials_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
@@ -151,7 +149,6 @@ def build_gspread_client() -> gspread.Client:
 # =========================
 # OANDA client
 # =========================
-
 
 class OandaError(RuntimeError):
     pass
@@ -264,7 +261,6 @@ class OandaClient:
 # Domain helpers
 # =========================
 
-
 @dataclass
 class SignalRow:
     row_number: int
@@ -332,7 +328,12 @@ class OrderPlan:
     side: str
     units: int
     margin_available: float
+    margin_used: float
+    uncapped_target_margin_budget: float
     target_margin_budget: float
+    max_additional_margin_allowed: float
+    projected_margin_used: float
+    projected_margin_used_pct: float
     sizing_method: str
     reference_price: float
     client_id: str
@@ -345,14 +346,12 @@ class OrderPlan:
     trained_at: str
 
 
-
 def parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if value is None:
         return False
     return str(value).strip().upper() == "TRUE"
-
 
 
 def parse_optional_float(value: Any) -> Optional[float]:
@@ -366,13 +365,11 @@ def parse_optional_float(value: Any) -> Optional[float]:
     return float(text)
 
 
-
 def parse_required_float(value: Any, field_name: str) -> float:
     parsed = parse_optional_float(value)
     if parsed is None:
         raise ValueError(f"Missing {field_name} in Signals row")
     return parsed
-
 
 
 def normalize_instrument(value: str) -> str:
@@ -393,11 +390,9 @@ def normalize_instrument(value: str) -> str:
     raise ValueError(f"Unsupported pair format '{value}'")
 
 
-
 def round_down(value: float, decimals: int) -> float:
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
-
 
 
 def normalize_header(value: Any) -> str:
@@ -407,7 +402,6 @@ def normalize_header(value: Any) -> str:
 # =========================
 # Sheet access (read-only)
 # =========================
-
 
 class SheetClient:
     REQUIRED_HEADERS = {
@@ -475,7 +469,6 @@ class SheetClient:
 # Trading bot
 # =========================
 
-
 class SignalsBot:
     def __init__(self, config: Config):
         self.config = config
@@ -490,11 +483,13 @@ class SignalsBot:
 
     def run_forever(self) -> None:
         logger.info(
-            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only | entry_time_blocks=%s",
+            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only | entry_time_blocks=%s | order_fraction=%.4f | max_margin_usage_pct=%.2f",
             self.config.worksheet_name,
             self.config.poll_seconds,
             self.config.dry_run,
             self.config.enable_entry_time_blocks,
+            self.config.order_fraction,
+            self.config.max_margin_usage_pct,
         )
         while self.running:
             started = time.time()
@@ -577,10 +572,12 @@ class SignalsBot:
 
         try:
             plan = self.build_order_plan(row)
+            if plan is None:
+                return
 
             if self.config.dry_run:
                 logger.info(
-                    "DRY RUN ENTRY | row=%s | instrument=%s | side=%s | units=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | sizing=%s | ref_price=%s | margin_available=%.2f | target_budget=%.2f | trained_at=%s",
+                    "DRY RUN ENTRY | row=%s | instrument=%s | side=%s | units=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | sizing=%s | ref_price=%s | margin_available=%.2f | margin_used=%.2f | uncapped_budget=%.2f | capped_budget=%.2f | max_additional_margin=%.2f | projected_margin_used=%.2f | projected_margin_used_pct=%.2f | trained_at=%s",
                     row.row_number,
                     plan.instrument,
                     plan.side,
@@ -594,7 +591,12 @@ class SignalsBot:
                     plan.sizing_method,
                     plan.reference_price,
                     plan.margin_available,
+                    plan.margin_used,
+                    plan.uncapped_target_margin_budget,
                     plan.target_margin_budget,
+                    plan.max_additional_margin_allowed,
+                    plan.projected_margin_used,
+                    plan.projected_margin_used_pct,
                     plan.trained_at,
                 )
                 self.armed_signals.add((row.row_number, plan.instrument, plan.side, plan.strategy_id))
@@ -625,7 +627,7 @@ class SignalsBot:
             )
 
             logger.info(
-                "ORDER PLACED | row=%s | instrument=%s | side=%s | units=%s | order_id=%s | trade_id=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | trained_at=%s",
+                "ORDER PLACED | row=%s | instrument=%s | side=%s | units=%s | order_id=%s | trade_id=%s | strategy_id=%s | score=%s | threshold=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | margin_available=%.2f | margin_used=%.2f | uncapped_budget=%.2f | capped_budget=%.2f | projected_margin_used=%.2f | projected_margin_used_pct=%.2f | trained_at=%s",
                 row.row_number,
                 plan.instrument,
                 plan.side,
@@ -638,22 +640,57 @@ class SignalsBot:
                 plan.arm_pct,
                 plan.trail_drop_pct,
                 plan.stop_loss_pct,
+                plan.margin_available,
+                plan.margin_used,
+                plan.uncapped_target_margin_budget,
+                plan.target_margin_budget,
+                plan.projected_margin_used,
+                plan.projected_margin_used_pct,
                 plan.trained_at,
             )
             self.armed_signals.add((row.row_number, plan.instrument, plan.side, plan.strategy_id))
         except Exception as exc:
             logger.exception("Row %s failed: %s", row.row_number, exc)
 
-    def build_order_plan(self, row: SignalRow) -> OrderPlan:
+    def build_order_plan(self, row: SignalRow) -> Optional[OrderPlan]:
         instrument = row.instrument
         side = row.side
         is_long = side == "LONG"
 
         account_payload = self.oanda.get_account()
         account = account_payload.get("account", {})
+
         margin_available = float(account.get("marginAvailable", 0.0))
+        margin_used = float(account.get("marginUsed", 0.0))
+
         if margin_available <= 0:
             raise OandaError("Account marginAvailable is zero or negative")
+
+        total_margin_capacity = margin_available + margin_used
+        if total_margin_capacity <= 0:
+            raise OandaError("Account total margin capacity is zero or negative")
+
+        uncapped_target_margin_budget = margin_available * self.config.order_fraction
+        max_allowed_margin_used = total_margin_capacity * self.config.max_margin_usage_pct
+        max_additional_margin_allowed = max(0.0, max_allowed_margin_used - margin_used)
+        target_margin_budget = min(uncapped_target_margin_budget, max_additional_margin_allowed)
+
+        if max_additional_margin_allowed <= 0 or target_margin_budget <= 0:
+            logger.info(
+                "ENTRY SKIPPED | row=%s | instrument=%s | side=%s | strategy_id=%s | reason=margin usage cap reached | margin_used=%.2f | margin_available=%.2f | max_margin_usage_pct=%.2f",
+                row.row_number,
+                instrument,
+                side,
+                row.strategy_id,
+                margin_used,
+                margin_available,
+                self.config.max_margin_usage_pct,
+            )
+            return None
+
+        effective_fraction = target_margin_budget / margin_available
+        projected_margin_used = margin_used + target_margin_budget
+        projected_margin_used_pct = (projected_margin_used / total_margin_capacity) * 100.0
 
         pricing_payload = self.oanda.get_pricing(instrument)
         price = pricing_payload["prices"][0]
@@ -663,7 +700,6 @@ class SignalsBot:
         reference_price = float(
             price["asks"][0]["price"] if is_long else price["bids"][0]["price"]
         )
-        target_margin_budget = margin_available * self.config.order_fraction
         client_id = self._client_id(row.row_number, instrument, side, row.strategy_id)
 
         units_available = price.get("unitsAvailable") or {}
@@ -672,7 +708,7 @@ class SignalsBot:
         raw_units_from_availability = default_bucket.get(side_key)
 
         if raw_units_from_availability is not None:
-            raw_units = float(raw_units_from_availability) * self.config.order_fraction
+            raw_units = float(raw_units_from_availability) * effective_fraction
             sized_units = max(1, int(math.floor(raw_units)))
             signed_units = sized_units if is_long else -sized_units
             return OrderPlan(
@@ -680,8 +716,13 @@ class SignalsBot:
                 side=side,
                 units=signed_units,
                 margin_available=margin_available,
+                margin_used=margin_used,
+                uncapped_target_margin_budget=uncapped_target_margin_budget,
                 target_margin_budget=target_margin_budget,
-                sizing_method="unitsAvailable.default",
+                max_additional_margin_allowed=max_additional_margin_allowed,
+                projected_margin_used=projected_margin_used,
+                projected_margin_used_pct=projected_margin_used_pct,
+                sizing_method="unitsAvailable.default.capped",
                 reference_price=reference_price,
                 client_id=client_id,
                 strategy_id=row.strategy_id,
@@ -713,6 +754,19 @@ class SignalsBot:
                 f"No usable home conversion returned for quote currency {quote_ccy}"
             )
 
+        min_trade_margin = minimum_trade_size * reference_price * quote_conversion * margin_rate
+        if min_trade_margin > max_additional_margin_allowed:
+            logger.info(
+                "ENTRY SKIPPED | row=%s | instrument=%s | side=%s | strategy_id=%s | reason=minimum trade size exceeds margin cap | min_trade_margin=%.4f | max_additional_margin=%.4f",
+                row.row_number,
+                instrument,
+                side,
+                row.strategy_id,
+                min_trade_margin,
+                max_additional_margin_allowed,
+            )
+            return None
+
         raw_units = target_margin_budget / (reference_price * quote_conversion * margin_rate)
         raw_units = max(minimum_trade_size, raw_units)
         rounded_units = round_down(raw_units, trade_units_precision)
@@ -727,6 +781,19 @@ class SignalsBot:
         if final_units <= 0:
             raise OandaError(f"Calculated non-positive units for {instrument}: {final_units}")
 
+        estimated_margin_for_units = abs(final_units) * reference_price * quote_conversion * margin_rate
+        if estimated_margin_for_units > max_additional_margin_allowed:
+            logger.info(
+                "ENTRY SKIPPED | row=%s | instrument=%s | side=%s | strategy_id=%s | reason=rounded order would exceed margin cap | estimated_margin=%.4f | max_additional_margin=%.4f",
+                row.row_number,
+                instrument,
+                side,
+                row.strategy_id,
+                estimated_margin_for_units,
+                max_additional_margin_allowed,
+            )
+            return None
+
         signed_units = final_units if is_long else -final_units
 
         return OrderPlan(
@@ -734,8 +801,13 @@ class SignalsBot:
             side=side,
             units=signed_units,
             margin_available=margin_available,
+            margin_used=margin_used,
+            uncapped_target_margin_budget=uncapped_target_margin_budget,
             target_margin_budget=target_margin_budget,
-            sizing_method="marginAvailable/homeConversions/marginRate",
+            max_additional_margin_allowed=max_additional_margin_allowed,
+            projected_margin_used=projected_margin_used,
+            projected_margin_used_pct=projected_margin_used_pct,
+            sizing_method="marginAvailable/homeConversions/marginRate.capped",
             reference_price=reference_price,
             client_id=client_id,
             strategy_id=row.strategy_id,
@@ -758,7 +830,6 @@ class SignalsBot:
 # =========================
 # Entrypoint
 # =========================
-
 
 def main() -> None:
     config = load_config()
