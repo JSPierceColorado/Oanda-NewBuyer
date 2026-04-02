@@ -5,10 +5,11 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -73,6 +74,7 @@ class Config:
     oanda_environment: str
     sheet_id: str
     worksheet_name: str
+    best_strategy_worksheet_name: str
     poll_seconds: int
     order_fraction: float
     max_margin_usage_pct: float
@@ -80,6 +82,9 @@ class Config:
     log_level: str
     request_timeout_seconds: int
     enable_entry_time_blocks: bool
+    fitness_drop_pct: float
+    fitness_stability_band_pct: float
+    fitness_stability_count: int
 
     @property
     def oanda_base_url(self) -> str:
@@ -96,12 +101,23 @@ def load_config() -> Config:
     if not (0.0 < max_margin_usage_pct < 1.0):
         raise ValueError("MAX_MARGIN_USAGE_PCT must be > 0 and < 1 (example: 0.90)")
 
+    fitness_drop_pct = env_float("FITNESS_DROP_PCT", 0.05)
+    if not (0.0 < fitness_drop_pct < 1.0):
+        raise ValueError("FITNESS_DROP_PCT must be > 0 and < 1 (example: 0.05)")
+
+    fitness_stability_band_pct = env_float("FITNESS_STABILITY_BAND_PCT", 0.05)
+    if not (0.0 < fitness_stability_band_pct < 1.0):
+        raise ValueError("FITNESS_STABILITY_BAND_PCT must be > 0 and < 1 (example: 0.05)")
+
+    fitness_stability_count = max(3, env_int("FITNESS_STABILITY_COUNT", 3))
+
     return Config(
         oanda_account_id=env_str("OANDA_ACCOUNT_ID", required=True),
         oanda_api_token=env_str("OANDA_API_TOKEN", required=True),
         oanda_environment=env_str("OANDA_ENVIRONMENT", "practice"),
         sheet_id=env_str("SHEET_ID", required=True),
         worksheet_name=env_str("SIGNALS_WORKSHEET", "Signals"),
+        best_strategy_worksheet_name=env_str("BEST_STRATEGY_WORKSHEET", "BestStrategy"),
         poll_seconds=max(3, env_int("POLL_SECONDS", 10)),
         order_fraction=env_float("ORDER_FRACTION", 0.02),
         max_margin_usage_pct=max_margin_usage_pct,
@@ -109,6 +125,9 @@ def load_config() -> Config:
         log_level=env_str("LOG_LEVEL", "INFO"),
         request_timeout_seconds=max(5, env_int("REQUEST_TIMEOUT_SECONDS", 20)),
         enable_entry_time_blocks=env_bool("ENABLE_ENTRY_TIME_BLOCKS", True),
+        fitness_drop_pct=fitness_drop_pct,
+        fitness_stability_band_pct=fitness_stability_band_pct,
+        fitness_stability_count=fitness_stability_count,
     )
 
 
@@ -322,6 +341,13 @@ class SignalRow:
         return "" if self.trained_at_raw is None else str(self.trained_at_raw).strip()
 
 
+@dataclass(frozen=True)
+class BestStrategySnapshot:
+    strategy_id: str
+    trained_at: str
+    fitness: float
+
+
 @dataclass
 class OrderPlan:
     instrument: str
@@ -419,6 +445,7 @@ class SheetClient:
         self.gc = build_gspread_client()
         self.sheet = self.gc.open_by_key(config.sheet_id)
         self.ws = self.sheet.worksheet(config.worksheet_name)
+        self.best_strategy_ws = self.sheet.worksheet(config.best_strategy_worksheet_name)
 
     def read_signal_rows(self) -> List[SignalRow]:
         all_values = self.ws.get_all_values()
@@ -464,6 +491,36 @@ class SheetClient:
             )
         return rows
 
+    def read_best_strategy_snapshot(self) -> Optional[BestStrategySnapshot]:
+        all_values = self.best_strategy_ws.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return None
+
+        fields: Dict[str, str] = {}
+        for row in all_values[1:]:
+            if len(row) < 2:
+                continue
+            key = normalize_header(row[0])
+            value = str(row[1]).strip()
+            if key:
+                fields[key] = value
+
+        strategy_id = fields.get("strategy_id", "").strip()
+        trained_at = fields.get("trained_at", "").strip()
+        fitness = parse_optional_float(fields.get("fitness"))
+
+        if not strategy_id or fitness is None:
+            logger.warning(
+                "BestStrategy sheet missing strategy_id or fitness; fitness gate not updated this cycle."
+            )
+            return None
+
+        return BestStrategySnapshot(
+            strategy_id=strategy_id,
+            trained_at=trained_at,
+            fitness=fitness,
+        )
+
 
 # =========================
 # Trading bot
@@ -477,19 +534,31 @@ class SignalsBot:
         self.running = True
         self.armed_signals: Set[Tuple[int, str, str, str]] = set()
 
+        self.current_best_strategy: Optional[BestStrategySnapshot] = None
+        self.best_strategy_history: Deque[BestStrategySnapshot] = deque(
+            maxlen=max(10, config.fitness_stability_count + 5)
+        )
+        self.last_best_strategy_key: Optional[Tuple[str, str, float]] = None
+        self.fitness_gate_active = False
+        self.fitness_gate_reason = ""
+
     def stop(self, *_args: Any) -> None:
         logger.info("Shutdown signal received. Stopping after current loop.")
         self.running = False
 
     def run_forever(self) -> None:
         logger.info(
-            "Bot started | worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only | entry_time_blocks=%s | order_fraction=%.4f | max_margin_usage_pct=%.2f",
+            "Bot started | worksheet=%s | best_strategy_worksheet=%s | poll_seconds=%s | dry_run=%s | sheet_mode=read_only | entry_time_blocks=%s | order_fraction=%.4f | max_margin_usage_pct=%.2f | fitness_drop_pct=%.2f | fitness_stability_band_pct=%.2f | fitness_stability_count=%s",
             self.config.worksheet_name,
+            self.config.best_strategy_worksheet_name,
             self.config.poll_seconds,
             self.config.dry_run,
             self.config.enable_entry_time_blocks,
             self.config.order_fraction,
             self.config.max_margin_usage_pct,
+            self.config.fitness_drop_pct,
+            self.config.fitness_stability_band_pct,
+            self.config.fitness_stability_count,
         )
         while self.running:
             started = time.time()
@@ -503,6 +572,12 @@ class SignalsBot:
                 time.sleep(sleep_for)
 
     def run_once(self) -> None:
+        try:
+            snapshot = self.sheet.read_best_strategy_snapshot()
+            self.update_fitness_gate(snapshot)
+        except Exception as exc:
+            logger.exception("Failed to refresh BestStrategy snapshot: %s", exc)
+
         rows = self.sheet.read_signal_rows()
         logger.info("Scanned %s populated signal rows", len(rows))
         for row in rows:
@@ -536,6 +611,72 @@ class SignalsBot:
 
         return None
 
+    def update_fitness_gate(self, snapshot: Optional[BestStrategySnapshot]) -> None:
+        if snapshot is None:
+            return
+
+        self.current_best_strategy = snapshot
+        observation_key = (
+            snapshot.strategy_id,
+            snapshot.trained_at,
+            round(snapshot.fitness, 8),
+        )
+
+        # Count only distinct BestStrategy observations, not repeated polls of the same state.
+        if observation_key == self.last_best_strategy_key:
+            return
+
+        previous = self.best_strategy_history[-1] if self.best_strategy_history else None
+        self.best_strategy_history.append(snapshot)
+        self.last_best_strategy_key = observation_key
+
+        logger.info(
+            "BEST STRATEGY | strategy_id=%s | trained_at=%s | fitness=%.4f | fitness_gate_active=%s",
+            snapshot.strategy_id,
+            snapshot.trained_at,
+            snapshot.fitness,
+            self.fitness_gate_active,
+        )
+
+        if previous is not None and previous.fitness > 0:
+            trigger_floor = previous.fitness * (1.0 - self.config.fitness_drop_pct)
+            if snapshot.fitness < trigger_floor:
+                drop_pct = ((previous.fitness - snapshot.fitness) / previous.fitness) * 100.0
+                self.fitness_gate_active = True
+                self.fitness_gate_reason = (
+                    f"fitness dropped {drop_pct:.2f}% "
+                    f"from {previous.fitness:.4f} to {snapshot.fitness:.4f}"
+                )
+                logger.warning("FITNESS GATE ACTIVATED | %s", self.fitness_gate_reason)
+                return
+
+        if self.fitness_gate_active and self.has_stable_fitness_window():
+            recent = list(self.best_strategy_history)[-self.config.fitness_stability_count:]
+            values = ", ".join(f"{item.fitness:.4f}" for item in recent)
+            self.fitness_gate_active = False
+            self.fitness_gate_reason = ""
+            logger.info(
+                "FITNESS GATE RELEASED | last %s distinct observations within %.2f%% band | values=%s",
+                self.config.fitness_stability_count,
+                self.config.fitness_stability_band_pct * 100.0,
+                values,
+            )
+
+    def has_stable_fitness_window(self) -> bool:
+        needed = self.config.fitness_stability_count
+        if len(self.best_strategy_history) < needed:
+            return False
+
+        recent = list(self.best_strategy_history)[-needed:]
+        values = [item.fitness for item in recent]
+        min_value = min(values)
+        max_value = max(values)
+
+        if min_value <= 0:
+            return False
+
+        return max_value <= min_value * (1.0 + self.config.fitness_stability_band_pct)
+
     def process_row(self, row: SignalRow) -> None:
         signal_key = self.signal_key(row)
 
@@ -552,6 +693,24 @@ class SignalsBot:
             logger.debug(
                 "Row %s already executed for current TRUE trigger. Waiting for reset.",
                 row.row_number,
+            )
+            return
+
+        if self.fitness_gate_active:
+            best = self.current_best_strategy
+            logger.info(
+                "ENTRY BLOCKED | row=%s | pair=%s | side=%s | strategy_id=%s | arm_pct=%.4f | trail_drop_pct=%.4f | stop_loss_pct=%.4f | reason=fitness gate active | gate_reason=%s | best_strategy_id=%s | best_strategy_fitness=%s | best_strategy_trained_at=%s",
+                row.row_number,
+                row.pair_raw,
+                row.side_raw,
+                row.strategy_id,
+                row.arm_pct,
+                row.trail_drop_pct,
+                row.stop_loss_pct,
+                self.fitness_gate_reason,
+                best.strategy_id if best else "",
+                f"{best.fitness:.4f}" if best else "",
+                best.trained_at if best else "",
             )
             return
 
